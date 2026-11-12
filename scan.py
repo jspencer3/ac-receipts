@@ -51,9 +51,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("scan")
 
 AMOUNT = r"\$?\s*(\d{1,3}(?:,\d{3})*\.\d{2}|\d*\.\d{2})(?!\d)"
-MONTHS = (
-    "jan feb mar apr may jun jul aug sep oct nov dec".split()
-)
+MONTHS = "jan feb mar apr may jun jul aug sep oct nov dec".split()
 DATE_PATTERNS = [
     (re.compile(r"\b(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})\b"), "ymd"),
     (re.compile(r"\b(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})\b"), "mdy"),
@@ -110,7 +108,9 @@ def parse_total(lines: list[str]) -> float | None:
     candidates: list[float] = []
     for i, line in enumerate(lines):
         low = line.lower()
-        if "total" not in low or re.search(r"sub\s*-?\s*total|total\s+(?:tax|savings|discount)", low):
+        if "total" not in low or re.search(
+            r"sub\s*-?\s*total|total\s+(?:tax|savings|discount)", low
+        ):
             continue
         amounts = line_amounts(line)
         if not amounts and i + 1 < len(lines):
@@ -156,7 +156,10 @@ def parse_vendor(lines: list[str]) -> str | None:
 
 
 def split_receipts(text: str) -> list[str]:
-    parts = [p.strip() for p in re.split(rf"^\s*{re.escape(DELIMITER)}\s*$", text, flags=re.M)]
+    parts = [
+        p.strip()
+        for p in re.split(rf"^\s*{re.escape(DELIMITER)}\s*$", text, flags=re.M)
+    ]
     return [p for p in parts if p] or [text]
 
 
@@ -190,7 +193,10 @@ def ocr_with_gemini(client: genai.Client, model: str, path: Path) -> str:
     mime_type = mimetypes.guess_type(path)[0] or "image/jpeg"
     response = client.models.generate_content(
         model=model,
-        contents=[PROMPT, types.Part.from_bytes(data=path.read_bytes(), mime_type=mime_type)],
+        contents=[
+            PROMPT,
+            types.Part.from_bytes(data=path.read_bytes(), mime_type=mime_type),
+        ],
     )
     return response.text or ""
 
@@ -204,13 +210,26 @@ def ocr_with_retry(
             return ocr_with_gemini(client, model, path)
         except Exception as exc:
             retryable = any(
-                m in str(exc) for m in ("429", "RESOURCE_EXHAUSTED", "503", "UNAVAILABLE", "504", "DEADLINE", "timed out", "Timeout")
+                m in str(exc)
+                for m in (
+                    "429",
+                    "RESOURCE_EXHAUSTED",
+                    "503",
+                    "UNAVAILABLE",
+                    "504",
+                    "DEADLINE",
+                    "timed out",
+                    "Timeout",
+                )
             )
             if attempt == max_retries or not retryable:
                 raise
             log.warning(
                 "Rate limited on %s (attempt %d/%d). Backing off %ds.",
-                path.name, attempt, max_retries, delay,
+                path.name,
+                attempt,
+                max_retries,
+                delay,
             )
             time.sleep(delay)
             delay *= 2
@@ -236,7 +255,8 @@ def main() -> int:
         log.error("Input dir %s does not exist.", args.input_dir)
         return 1
     images = sorted(
-        p for p in args.input_dir.iterdir()
+        p
+        for p in args.input_dir.iterdir()
         if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
     )
     if not images:
@@ -251,12 +271,15 @@ def main() -> int:
     if args.dry_run:
         for img in images:
             cached = (ocr_dir / f"{img.name}.txt").exists()
-            log.info("[dry-run] %s (%s)", img.name, "cached OCR" if cached else "would OCR")
+            log.info(
+                "[dry-run] %s (%s)", img.name, "cached OCR" if cached else "would OCR"
+            )
         return 0
 
     client = genai.Client(
         api_key=api_key, http_options=types.HttpOptions(timeout=REQUEST_TIMEOUT_MS)
     )
+    complete_dir = args.input_dir / "complete"
     rows: list[dict] = []
     for img in images:
         cache = ocr_dir / f"{img.name}.txt"
@@ -264,7 +287,10 @@ def main() -> int:
             text = cache.read_text()
         else:
             if quota["count"] >= DAILY_REQUEST_LIMIT:
-                log.warning("Daily request limit (%d) reached. Re-run later.", DAILY_REQUEST_LIMIT)
+                log.warning(
+                    "Daily request limit (%d) reached. Re-run later.",
+                    DAILY_REQUEST_LIMIT,
+                )
                 break
             log.info("OCR %s ...", img.name)
             try:
@@ -279,6 +305,8 @@ def main() -> int:
             time.sleep(args.sleep)
         for n, part in enumerate(split_receipts(text), start=1):
             rows.append({"file": img.name, "receipt": n, **parse_receipt(part)})
+        complete_dir.mkdir(parents=True, exist_ok=True)
+        img.replace(complete_dir / img.name)
 
     with (args.output_dir / CSV_NAME).open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
