@@ -8,7 +8,7 @@ Usage:
                    [--model gemini-3.5-flash-lite] [--sleep 5] [--dry-run]
 
 Outputs:
-    outputs/receipts.csv      one row per receipt
+    outputs/receipts.csv      one row per receipt (multiple per page allowed)
     outputs/ocr/<name>.txt    cached raw OCR text (re-runs skip the API)
 
 Requires GEMINI_API_KEY in the environment (loaded from .env).
@@ -32,20 +32,25 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
+DELIMITER = "=====RECEIPT====="
 PROMPT = (
-    "Transcribe all text on this receipt exactly as printed, preserving "
-    "line breaks. Return only the text."
+    "This page may contain one or more separate receipts. Transcribe all "
+    "text exactly as printed, preserving line breaks. If there is more than "
+    f"one receipt, put a line containing only {DELIMITER} between each "
+    "receipt. Do not put the delimiter before the first or after the last "
+    "receipt. Return only the text."
 )
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif", ".pdf"}
 DAILY_REQUEST_LIMIT = 1500  # Gemini free tier RPD ceiling
+REQUEST_TIMEOUT_MS = 120_000
 QUOTA_NAME = ".quota.json"
 CSV_NAME = "receipts.csv"
-CSV_FIELDS = ["file", "vendor", "date", "total", "sales_tax", "needs_review"]
+CSV_FIELDS = ["file", "receipt", "vendor", "date", "total", "sales_tax", "needs_review"]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("scan")
 
-AMOUNT = r"\$?\s*(\d{1,3}(?:,\d{3})*\.\d{2}|\d+\.\d{2})(?!\d)"
+AMOUNT = r"\$?\s*(\d{1,3}(?:,\d{3})*\.\d{2}|\d*\.\d{2})(?!\d)"
 MONTHS = (
     "jan feb mar apr may jun jul aug sep oct nov dec".split()
 )
@@ -150,6 +155,11 @@ def parse_vendor(lines: list[str]) -> str | None:
     return None
 
 
+def split_receipts(text: str) -> list[str]:
+    parts = [p.strip() for p in re.split(rf"^\s*{re.escape(DELIMITER)}\s*$", text, flags=re.M)]
+    return [p for p in parts if p] or [text]
+
+
 def parse_receipt(text: str) -> dict:
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     result = {
@@ -186,7 +196,7 @@ def ocr_with_gemini(client: genai.Client, model: str, path: Path) -> str:
 
 
 def ocr_with_retry(
-    client: genai.Client, model: str, path: Path, max_retries: int = 3
+    client: genai.Client, model: str, path: Path, max_retries: int = 5
 ) -> str:
     delay = 10
     for attempt in range(1, max_retries + 1):
@@ -194,7 +204,7 @@ def ocr_with_retry(
             return ocr_with_gemini(client, model, path)
         except Exception as exc:
             retryable = any(
-                m in str(exc) for m in ("429", "RESOURCE_EXHAUSTED", "503", "UNAVAILABLE")
+                m in str(exc) for m in ("429", "RESOURCE_EXHAUSTED", "503", "UNAVAILABLE", "504", "DEADLINE", "timed out", "Timeout")
             )
             if attempt == max_retries or not retryable:
                 raise
@@ -244,7 +254,9 @@ def main() -> int:
             log.info("[dry-run] %s (%s)", img.name, "cached OCR" if cached else "would OCR")
         return 0
 
-    client = genai.Client(api_key=api_key)
+    client = genai.Client(
+        api_key=api_key, http_options=types.HttpOptions(timeout=REQUEST_TIMEOUT_MS)
+    )
     rows: list[dict] = []
     for img in images:
         cache = ocr_dir / f"{img.name}.txt"
@@ -259,13 +271,14 @@ def main() -> int:
                 text = ocr_with_retry(client, args.model, img)
             except Exception as exc:
                 log.error("OCR failed for %s: %s", img.name, exc)
-                rows.append({"file": img.name, "needs_review": True})
+                rows.append({"file": img.name, "receipt": 1, "needs_review": True})
                 continue
             cache.write_text(text)
             quota["count"] += 1
             quota_path.write_text(json.dumps(quota, indent=2))
             time.sleep(args.sleep)
-        rows.append({"file": img.name, **parse_receipt(text)})
+        for n, part in enumerate(split_receipts(text), start=1):
+            rows.append({"file": img.name, "receipt": n, **parse_receipt(part)})
 
     with (args.output_dir / CSV_NAME).open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
